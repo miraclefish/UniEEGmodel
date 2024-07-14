@@ -7,12 +7,13 @@ class BalancedDataLoaderIterator:
 
         self.num_dataloaders = len(dataloaders)
 
-        max_length = max(len(dataloader) for dataloader in dataloaders)
-
         length_list = [len(dataloader) for dataloader in dataloaders]
+
+        max_length = max(length_list)
+
         print("data loader length:", length_list)
         print("max dataloader length:", max_length,
-              "epoch iteration:", max_length * self.num_dataloaders)
+              "\nepoch iteration:", max_length * self.num_dataloaders)
         self.total_length = max_length * self.num_dataloaders
         self.current_iteration = 0
         self.probabilities = torch.ones(
