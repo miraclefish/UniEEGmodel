@@ -2,6 +2,8 @@ from pathlib import Path
 from gluonts.dataset.jsonl import JsonLinesWriter
 from gluonts.dataset.repository import get_dataset
 import os
+import h5py
+import bisect
 import numpy as np
 import pandas as pd
 import glob
@@ -16,6 +18,81 @@ from sktime.datasets import load_from_tsfile_to_dataframe
 import warnings
 
 warnings.filterwarnings('ignore')
+
+
+class EEGDataset(Dataset):
+    """Read single hdf5 file regardless of label, subject, and paradigm."""
+
+    def __init__(self, root_path: str, dataset_name: str, window_size: int = 200, stride_size: int = 1,
+                 start_percentage: float = 0, end_percentage: float = 1):
+        '''
+        Extract ${dataset_name} from root_path.
+
+        param Path root_path: the root path of all datasets
+        param int window_size: the length of a single sample
+        param int stride_size: the interval between two adjacent samples
+        param float start_percentage: Index of percentage of the first sample of the dataset in the data file (inclusive)
+        param float end_percentage: Index of percentage of end of dataset sample in data file (not included)
+        '''
+        self.root_path = root_path
+        self.dataset_name = dataset_name
+        self.window_size = window_size
+        self.stride_size = stride_size
+        self.start_percentage = start_percentage
+        self.end_percentage = end_percentage
+
+        self.file_path = Path(self.root_path) / f'{self.dataset_name}.hdf5'
+        self.__file = None
+        self.length = None
+        self.feature_size = None
+
+        self.subjects = []
+        self.global_idxes = []
+        self.local_idxes = []
+
+        self.__init_dataset()
+
+    def __init_dataset(self) -> None:
+        self.__file = h5py.File(str(self.file_path), 'r')
+        self.subjects = [i for i in self.__file]
+
+        global_idx = 0
+        for subject in self.subjects:
+            self.global_idxes.append(global_idx)  # the start index of the subject's sample in the dataset
+            subject_len = self.__file[subject]['eeg'].shape[1]
+            # total number of samples
+            total_sample_num = (subject_len - self.window_size) // self.stride_size + 1
+            # cut out part of samples
+            start_idx = int(total_sample_num * self.start_percentage) * self.stride_size
+            end_idx = int(total_sample_num * self.end_percentage - 1) * self.stride_size
+
+            self.local_idxes.append(start_idx)
+            global_idx += (end_idx - start_idx) // self.stride_size + 1
+        self.length = global_idx
+
+        self.feature_size = [i for i in self.__file[self.subjects[0]]['eeg'].shape]
+        self.feature_size[1] = self.window_size
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx: int):
+        subject_idx = bisect.bisect(self.global_idxes, idx) - 1
+        item_start_idx = (idx - self.global_idxes[subject_idx]) * self.stride_size + self.local_idxes[subject_idx]
+        label = torch.tensor([0])
+        return self.__file[self.subjects[subject_idx]]['eeg'][:, item_start_idx:item_start_idx + self.window_size].T, label
+
+    def free(self) -> None:
+        if self.__file:
+            self.__file.close()
+            self.__file = None
+
+    def get_ch_names(self):
+        ch_names = self.__file[self.subjects[0]]['eeg'].attrs['chOrder']
+        if 'EEG' in ch_names[0]:
+            pattern = r'\s(.*?)\-'
+            ch_names = [re.search(pattern, ch).group(1) for ch in ch_names]
+        return ch_names
 
 
 class Dataset_ETT_hour(Dataset):
@@ -866,9 +943,9 @@ class GLUONTSDataset(Dataset):
         ), "{} dataset not recognized".format(dataset_name)
 
         if size is None:  # Hardcoded behavior, we can change via setting size
-            self.seq_len = default_pred_lens[dataset_name] * 2
+            self.seq_len = self.default_pred_lens[dataset_name] * 2
             self.label_len = 0
-            self.pred_len = default_pred_lens[dataset_name]
+            self.pred_len = self.default_pred_lens[dataset_name]
         else:
             self.seq_len = size[0]
             self.label_len = size[1]
