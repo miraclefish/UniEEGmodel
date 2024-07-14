@@ -76,11 +76,19 @@ class Exp_All_Task(object):
             self.args.task_data_config_path)
         self.task_data_config_list = get_task_data_config_list(
             self.task_data_config, default_batch_size=self.args.batch_size)
-        device_id = dist.get_rank() % torch.cuda.device_count()
+        if args.ddp:
+            device_id = dist.get_rank() % torch.cuda.device_count()
+            print("this device_id:", device_id)
+        else:
+            device_id = args.device
         print("this device_id:", device_id)
         self.device_id = device_id
 
-    def _build_model(self, ddp=True):
+    def _build_model(self, ddp=False):
+        if ddp:
+            ddp = self.args.ddp
+        else:
+            ddp = ddp
         module = importlib.import_module("models."+self.args.model)
         model = module.Model(
             self.args, self.task_data_config_list, pretrain=True).to(self.device_id)
@@ -90,21 +98,27 @@ class Exp_All_Task(object):
         return model.to(self.device_id)
 
     def _get_data(self, flag):
+        ddp = self.args.ddp
         data_set_list = []
         data_loader_list = []
         for task_data_name, task_config in self.task_data_config.items():
             print("loading dataset:", task_data_name, folder=self.path)
-            if task_config['data'] == 'UEA' and flag == 'val':
-                # TODO strange that no val set is used for classification. Set to test set for val
-                flag = 'test'
+            # if task_config['data'] == 'UEA' and flag == 'val':
+            #     # TODO strange that no val set is used for classification. Set to test set for val
+            #     flag = 'test'
+            print(f'flag:{flag}')
             data_set, data_loader = data_provider(
-                self.args, task_config, flag, ddp=True)
+                self.args, task_config, flag, ddp=ddp)
             data_set_list.append(data_set)
             data_loader_list.append(data_loader)
         return data_set_list, data_loader_list
 
     def _select_optimizer(self):
-        eff_batch_size = self.args.batch_size * self.args.acc_it * get_world_size()
+        if self.args.ddp:
+            world_size = get_world_size()
+        else:
+            world_size = 1
+        eff_batch_size = self.args.batch_size * self.args.acc_it * world_size
         real_learning_rate = self.args.learning_rate * eff_batch_size / 32
         print("base lr: %.2e" % (self.args.learning_rate * 32 / eff_batch_size))
         print("actual lr: %.2e" % real_learning_rate)
@@ -122,8 +136,9 @@ class Exp_All_Task(object):
             os.makedirs(path)
         self.path = path
 
-        torch.cuda.synchronize()
-        dist.barrier()
+        if self.args.ddp:
+            torch.cuda.synchronize()
+            dist.barrier()
 
         # Data loader
         _, train_loader_list = self._get_data(flag='train')
@@ -135,8 +150,9 @@ class Exp_All_Task(object):
             self.memory_check(data_loader_cycle)
             torch.cuda.empty_cache()
 
-        torch.cuda.synchronize()
-        dist.barrier()
+        if self.args.ddp:
+            torch.cuda.synchronize()
+            dist.barrier()
 
         # Model
         self.model = self._build_model()
@@ -166,7 +182,8 @@ class Exp_All_Task(object):
             print("Epoch: {0}, Steps: {1} | Avg Train Loss: {2:.7f}".format(
                 epoch + 1, train_steps, train_loss), folder=self.path)
             if is_main_process():
-                wandb.log({'train_loss_avg': train_loss})
+                if self.args.wandb:
+                    wandb.log({'train_loss_avg': train_loss})
 
             if is_main_process():
                 save_dict = {
@@ -181,6 +198,7 @@ class Exp_All_Task(object):
         return self.model
 
     def train_one_epoch(self, model_optim, data_loader_cycle, criterion, epoch, train_steps, scaler, lr_schedule):
+        #一次epoch训练完所有的数据集，每个数据集出现一次batch
         current_device = torch.cuda.current_device()
         train_loss_set = []
 
@@ -193,6 +211,8 @@ class Exp_All_Task(object):
         self.model.zero_grad(set_to_none=True)
         loss_sum_display = 0
 
+        loss = 0
+        # 外循环训练不同数据集,每次采样不同数据集的一个batch
         for i, (sample_init, task_id) in enumerate(data_loader_cycle):
             it = train_steps * epoch + i
             for _, param_group in enumerate(model_optim.param_groups):
@@ -201,6 +221,8 @@ class Exp_All_Task(object):
             # Get batch data based on the real batch size of each task: avoid OOM for large samples
             task_name = self.task_data_config_list[task_id][1]['task_name']
             small_batch_size = self.task_data_config_list[task_id][1]['max_batch']
+
+            # 根据设备能够承受的最大batchsize，将一个batch分成多个小batch
             sample_list = self.get_multi_source_data(
                 sample_init, task_name, small_batch_size, min_keep_ratio=min_keep_ratio)
             len_sample_list = len(sample_list)
@@ -246,7 +268,8 @@ class Exp_All_Task(object):
                     'train_sum_loss_'+self.task_data_config_list[task_id][0]: loss_dict['loss'].item(),
                     "loss_avg": loss_sum_display/(i+1)
                 }
-                wandb.log(wandb_loss_dict)
+                if self.args.wandb:
+                    wandb.log(wandb_loss_dict)
 
             if (i + 1) % 50 == 0 and is_main_process():
                 print("\titers: {0}, epoch: {1} | lr: {2:.5} | loss_avg: {3} | current_loss: {4} |current data: {5}".format(
@@ -288,7 +311,13 @@ class Exp_All_Task(object):
             batch_x = batch_x.float().to(self.device_id)
             batch_x_mark = padding_mask.float().to(self.device_id)
             padding_mask = batch_x_mark.bool().to(self.device_id)
-
+        elif 'EEG' in task_name:
+            batch_x, _ = this_batch
+            batch_x = batch_x.float().to(self.device_id)
+            batch_x_mark = torch.ones(
+                (batch_x.shape[0], batch_x.shape[1],batch_x.shape[2]), dtype=torch.bool).to(self.device_id)
+            padding_mask = torch.ones(
+                (batch_x.shape[0], batch_x.shape[1]), dtype=torch.bool).to(self.device_id)
         if min_keep_ratio is not None:
             keep_ratios = torch.rand(
                 1, device=batch_x.device) * (1.0 - min_keep_ratio) + min_keep_ratio
@@ -347,16 +376,26 @@ class Exp_All_Task(object):
                         batch_x = batch_x.float().to(self.device_id)
                         batch_x_mark = torch.ones(
                             (batch_x.shape[0], batch_x.shape[1]), dtype=torch.bool).to(self.device_id)
-
+                    elif 'EEG' in task_name:
+                        batch_x, _ = sample
+                        batch_x = batch_x.float().to(self.device_id)
+                        batch_x_mark = torch.ones(
+                            (batch_x.shape[0], batch_x.shape[1],batch_x.shape[2]), dtype=torch.bool).to(self.device_id)
                     print(task_id, task_name,
                           sample[0].shape, "max batch size", max_batch_size)
                     with torch.cuda.amp.autocast():
                         model_output = model_tmp(
                             x_enc=batch_x, x_mark_enc=batch_x_mark, task_id=task_id, task_name=task_name, enable_mask=True)
                     loss = 0.0
+                    #直接进行backward，测试最大训练内存容量
                     for each in model_output:
                         if each is not None:
-                            loss += each.sum()
+                            #如果是list，就对每个元素求和
+                            if isinstance(each, list):
+                                for item in each:
+                                    loss += item.sum()
+                            else:
+                                loss += each.sum()
 
                     loss.backward()
                     max_batch_size = batch_size
