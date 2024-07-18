@@ -18,6 +18,7 @@ import yaml
 import wandb
 import importlib
 import sys
+import json
 
 warnings.filterwarnings('ignore')
 
@@ -60,28 +61,34 @@ def get_task_data_config_list(task_data_config, default_batch_size=None):
     return task_data_config_list
 
 
-def init_and_merge_datasets(data_loader_list):
+def init_and_merge_datasets(data_loader_list, logger=None):
     dataloader = BalancedDataLoaderIterator(data_loader_list)
+    if logger:
+        logger.info(f"data loader length: {dataloader.length_list}")
+        logger.info(f"max dataloader length: {dataloader.max_length}")
+        logger.info(f"epoch iteration: {dataloader.max_length * dataloader.num_dataloaders}")
     train_steps = dataloader.__len__()
 
     return dataloader, train_steps
 
 
 class Exp_All_Task(object):
-    def __init__(self, args):
+    def __init__(self, args, logger=None):
         super(Exp_All_Task, self).__init__()
 
         self.args = args
+        self.logger = logger
         self.task_data_config = read_task_data_config(
             self.args.task_data_config_path)
         self.task_data_config_list = get_task_data_config_list(
             self.task_data_config, default_batch_size=self.args.batch_size)
         if args.ddp:
             device_id = dist.get_rank() % torch.cuda.device_count()
-            print("this device_id:", device_id)
         else:
             device_id = args.device
-        print("this device_id:", device_id)
+
+        if self.logger:
+            self.logger.info(f"this device_id: {device_id}")
         self.device_id = device_id
 
     def _build_model(self, ddp=False):
@@ -102,13 +109,14 @@ class Exp_All_Task(object):
         data_set_list = []
         data_loader_list = []
         for task_data_name, task_config in self.task_data_config.items():
-            print("loading dataset:", task_data_name, folder=self.path)
             # if task_config['data'] == 'UEA' and flag == 'val':
             #     # TODO strange that no val set is used for classification. Set to test set for val
             #     flag = 'test'
-            print(f'flag:{flag}')
             data_set, data_loader = data_provider(
                 self.args, task_config, flag, ddp=ddp)
+
+            if self.logger:
+                self.logger.info(f"loading dataset: {task_data_name} | {flag} | value_interval: {data_set.value_interval} | data length: {len(data_set)}")
             data_set_list.append(data_set)
             data_loader_list.append(data_loader)
         return data_set_list, data_loader_list
@@ -120,12 +128,14 @@ class Exp_All_Task(object):
             world_size = 1
         eff_batch_size = self.args.batch_size * self.args.acc_it * world_size
         real_learning_rate = self.args.learning_rate * eff_batch_size / 32
-        print("base lr: %.2e" % (self.args.learning_rate * 32 / eff_batch_size))
-        print("actual lr: %.2e" % real_learning_rate)
         self.real_learning_rate = real_learning_rate
 
-        print("accumulate grad iterations: %d" % self.args.acc_it)
-        print("effective batch size: %d" % eff_batch_size)
+        if self.logger:
+            self.logger.info(f"base lr: {self.args.learning_rate * 32 / eff_batch_size:.2e}")
+            self.logger.info(f"actual lr: {real_learning_rate:.2e}")
+            self.logger.info(f"accumulate grad iterations: {self.args.acc_it}")
+            self.logger.info(f"effective batch size: {eff_batch_size}")
+
         model_optim = optim.Adam(self.model.parameters(
         ), lr=real_learning_rate, betas=(0.9, self.args.beta2), weight_decay=self.args.weight_decay, eps=self.args.eps)
         return model_optim
@@ -143,7 +153,7 @@ class Exp_All_Task(object):
         # Data loader
         _, train_loader_list = self._get_data(flag='train')
         data_loader_cycle, train_steps = init_and_merge_datasets(
-            train_loader_list)
+            train_loader_list, self.logger)
 
         # Set up batch size for each task
         if self.args.memory_check:
@@ -158,9 +168,9 @@ class Exp_All_Task(object):
         self.model = self._build_model()
 
         pytorch_total_params = sum(p.numel() for p in self.model.parameters())
-        print("Parameters number {} M".format(
-            pytorch_total_params/1e6), folder=self.path)
-        print("{} steps for each epoch".format(train_steps), folder=self.path)
+        if self.logger:
+            self.logger.info(f"Parameters number {pytorch_total_params/1e6:.3f} M")
+            self.logger.info(f"{train_steps} steps for each epoch")
 
         # Optimizer
         model_optim = self._select_optimizer()
@@ -179,13 +189,11 @@ class Exp_All_Task(object):
             train_loss = self.train_one_epoch(
                 model_optim, data_loader_cycle, criterion, epoch, train_steps, scaler, lr_schedule)
 
-            print("Epoch: {0}, Steps: {1} | Avg Train Loss: {2:.7f}".format(
-                epoch + 1, train_steps, train_loss), folder=self.path)
             if is_main_process():
+                self.logger.info(f"Epoch: {epoch + 1}, Steps: {train_steps} | Avg Train Loss: {train_loss:.7f}")
                 if self.args.wandb:
                     wandb.log({'train_loss_avg': train_loss})
 
-            if is_main_process():
                 save_dict = {
                     'student': self.model.state_dict(),
                     'optimizer': model_optim.state_dict(),
@@ -220,6 +228,7 @@ class Exp_All_Task(object):
 
             # Get batch data based on the real batch size of each task: avoid OOM for large samples
             task_name = self.task_data_config_list[task_id][1]['task_name']
+            dataset_name = self.task_data_config_list[task_id][1]['dataset']
             small_batch_size = self.task_data_config_list[task_id][1]['max_batch']
 
             # 根据设备能够承受的最大batchsize，将一个batch分成多个小batch
@@ -234,7 +243,7 @@ class Exp_All_Task(object):
                 with torch.cuda.amp.autocast():
                     model_output = self.model(
                         x_enc=x_enc, x_mark_enc=x_mark_enc, task_id=task_id, task_name=task_name, enable_mask=True)
-                loss_dict = criterion(model_output, x_enc, pad_mask)
+                loss_dict = criterion(model_output, x_enc)
                 loss = loss_dict['loss']
                 loss /= acc_it
                 loss /= len_sample_list
@@ -250,7 +259,9 @@ class Exp_All_Task(object):
 
             if (i+1) % acc_it == 0:
                 model_optim.zero_grad()
-            torch.cuda.synchronize()
+
+            if self.args.ddp:
+                torch.cuda.synchronize()
 
             loss_sum_display += loss_display
 
@@ -262,22 +273,18 @@ class Exp_All_Task(object):
 
             if is_main_process():
                 wandb_loss_dict = {
-                    'norm': norm_value if norm_value is not None else 0,
-                    'train_cls_loss_'+self.task_data_config_list[task_id][0]: loss_dict['cls_loss'].item(),
-                    'train_mask_loss_'+self.task_data_config_list[task_id][0]: loss_dict['mask_loss'].item(),
-                    'train_sum_loss_'+self.task_data_config_list[task_id][0]: loss_dict['loss'].item(),
+                    'norm': norm_value if norm_value is not None else 0.,
+                    f'train_mask_loss_{self.task_data_config_list[task_id][0]}': loss_dict['mask_loss'].item(),
                     "loss_avg": loss_sum_display/(i+1)
                 }
                 if self.args.wandb:
                     wandb.log(wandb_loss_dict)
 
-            if (i + 1) % 50 == 0 and is_main_process():
-                print("\titers: {0}, epoch: {1} | lr: {2:.5} | loss_avg: {3} | current_loss: {4} |current data: {5}".format(
-                    i + 1, epoch + 1, lr_schedule[it], loss_sum_display/(i+1), loss.item() * acc_it, task_name), folder=self.path)
+            if (i + 1) % 100 == 0 and is_main_process():
+                self.logger.info(f"\titers: {i + 1}, epoch: {epoch + 1} | lr: {lr_schedule[it]:.8f} | loss_avg: {loss_sum_display/(i+1):.5f} | current_loss: {loss.item() * acc_it:.5f} | current_data: {dataset_name}")
 
         if is_main_process():
-            print("Epoch: {} cost time: {}".format(
-                epoch + 1, time.time() - epoch_time), folder=self.path)
+            self.logger.info(f"Epoch: {epoch + 1} cost time: {time.time() - epoch_time}")
         train_loss = np.average(train_loss_set)
 
         return train_loss
@@ -352,21 +359,22 @@ class Exp_All_Task(object):
         extra_mem = torch.empty(
             num_elements, dtype=torch.float32, device=self.device_id)
 
-        model_tmp = self._build_model(ddp=False)
-        criterion = UnifiedMaskRecLoss().to(self.device_id)
-        model_tmp.train()
-        model_tmp.zero_grad(set_to_none=True)
-
         for data_loader_id in range(data_loader_cycle.num_dataloaders):
             batch_size = 1
             max_batch_size = 0
-            torch.cuda.synchronize()
+
+            if self.args.ddp:
+                torch.cuda.synchronize()
+
+            model_tmp = self._build_model(ddp=False)
+            model_tmp.train()
             model_tmp.zero_grad(set_to_none=True)
             while True:
                 try:
                     sample, task_id = data_loader_cycle.generate_fake_samples_for_batch(
                         data_loader_id, batch_size)
                     task_name = self.task_data_config_list[task_id][1]['task_name']
+                    dataset_name = self.task_data_config_list[task_id][1]['dataset']
                     if "long_term_forecast" in task_name:
                         batch_x, _, batch_x_mark, _ = sample
                         batch_x = batch_x.float().to(self.device_id)
@@ -381,8 +389,8 @@ class Exp_All_Task(object):
                         batch_x = batch_x.float().to(self.device_id)
                         batch_x_mark = torch.ones(
                             (batch_x.shape[0], batch_x.shape[1],batch_x.shape[2]), dtype=torch.bool).to(self.device_id)
-                    print(task_id, task_name,
-                          sample[0].shape, "max batch size", max_batch_size)
+                    if self.logger:
+                        self.logger.info(f"task_id: {task_id}, dataset_name: {dataset_name}, sample_shape: {sample[0].shape}, max_batch_size: {max_batch_size}")
                     with torch.cuda.amp.autocast():
                         model_output = model_tmp(
                             x_enc=batch_x, x_mark_enc=batch_x_mark, task_id=task_id, task_name=task_name, enable_mask=True)
@@ -402,26 +410,30 @@ class Exp_All_Task(object):
                     batch_size *= 2
 
                     if max_batch_size >= self.args.batch_size:
-                        print("can support default batchsize:",
-                              self.args.batch_size, max_batch_size)
-                        self.task_data_config_list[task_id][1]['max_batch'] = max_batch_size
-                        self.task_data_config_list[task_id][1]['checkpointing'] = False
+                        if self.logger:
+                            self.logger.info(f"can support default batchsize: {self.args.batch_size}, {max_batch_size}")
+                            self.task_data_config_list[task_id][1]['max_batch'] = max_batch_size
+                            self.task_data_config_list[task_id][1]['checkpointing'] = False
                         break
 
                 except Exception as e:
-                    task_name = self.task_data_config_list[task_id][1]['task_name']
-                    print(task_id,  "max batch size:", max_batch_size)
+                    if self.logger:
+                        self.logger.info(f"An exception occurred: {e}")
+                        self.logger.info(f"task_id: {task_id}, dataset_name: {dataset_name}, max_batch_size: {max_batch_size}")
+                        self.logger.info(f"cannot support default batchsize: {self.args.batch_size}, {max_batch_size}")
+
                     self.task_data_config_list[task_id][1]['max_batch'] = max_batch_size
-                    print(f"An exception occurred: {e}")
                     del model_tmp
-                    del criterion
                     torch.cuda.empty_cache()
-                    model_tmp = self._build_model(ddp=False)
-                    criterion = UnifiedMaskRecLoss().to(self.device_id)
                     break
         del extra_mem
-        del model_tmp
-        del criterion
+        try:
+            del model_tmp
+        except:
+            pass
         torch.cuda.empty_cache()
-        print(self.task_data_config_list)
+        text = "Checking all task data config: \n"
+        text += json.dumps(self.task_data_config_list, indent=4)
+        if self.logger:
+            self.logger.info(text)
         return
