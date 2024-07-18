@@ -7,20 +7,21 @@ from torch.utils.data.distributed import DistributedSampler
 
 data_dict = {
     'TUH': EEGDataset,
-    'ETTh1': Dataset_ETT_hour,
-    'ETTh2': Dataset_ETT_hour,
-    'ETTm1': Dataset_ETT_minute,
-    'ETTm2': Dataset_ETT_minute,
-    'custom': Dataset_Custom,
-    # 'm4': Dataset_M4,  Removed due to the LICENSE file constraints of m4.py
-    'PSM': PSMSegLoader,
-    'MSL': MSLSegLoader,
-    'SMAP': SMAPSegLoader,
-    'SMD': SMDSegLoader,
-    'SWAT': SWATSegLoader,
-    'UEA': UEAloader,
-    # datasets from gluonts package:
-    "gluonts": GLUONTSDataset,
+    'BCICIV': EEGDataset,
+    # 'ETTh1': Dataset_ETT_hour,
+    # 'ETTh2': Dataset_ETT_hour,
+    # 'ETTm1': Dataset_ETT_minute,
+    # 'ETTm2': Dataset_ETT_minute,
+    # 'custom': Dataset_Custom,
+    # # 'm4': Dataset_M4,  Removed due to the LICENSE file constraints of m4.py
+    # 'PSM': PSMSegLoader,
+    # 'MSL': MSLSegLoader,
+    # 'SMAP': SMAPSegLoader,
+    # 'SMD': SMDSegLoader,
+    # 'SWAT': SWATSegLoader,
+    # 'UEA': UEAloader,
+    # # datasets from gluonts package:
+    # "gluonts": GLUONTSDataset,
 }
 
 
@@ -56,6 +57,7 @@ def data_provider(args, config, flag, ddp=False):  # args,
             dataset_name=config['dataset_name'],
             window_size=config['window_size'],
             stride_size=config['stride_size'],
+            try_run=args.try_run,
         )
 
         # print("ddp mode is set to false for anomaly_detection", ddp, len(data_set))
