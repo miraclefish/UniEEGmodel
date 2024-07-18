@@ -1,12 +1,12 @@
 task_dataset:
-  TUABtrain:
+  TUAB:
     task_name: EEG_pretrain
     dataset_name: TUABtrain
     dataset: TUAB
     data: TUH
     root_path: /dataYYF/YYF/EEGdata
-    window_size: 1000
-    stride_size: 200
+    window_size: 2048
+    stride_size: 256
     enc_in: 23
     embed: timeF
 
@@ -16,8 +16,8 @@ task_dataset:
     dataset: TUAR
     data: TUH
     root_path: /dataYYF/YYF/EEGdata
-    window_size: 1000
-    stride_size: 200
+    window_size: 2048
+    stride_size: 256
     enc_in: 23
     embed: timeF
 
@@ -27,19 +27,19 @@ task_dataset:
     dataset: TUEP
     data: TUH
     root_path: /dataYYF/YYF/EEGdata
-    window_size: 1000
-    stride_size: 200
+    window_size: 2048
+    stride_size: 256
     enc_in: 23
     embed: timeF
 
-  TUEVtrain:
+  TUEV:
     task_name: EEG_pretrain
     dataset_name: TUEVtrain
     dataset: TUEV
     data: TUH
     root_path: /dataYYF/YYF/EEGdata
-    window_size: 1000
-    stride_size: 200
+    window_size: 2048
+    stride_size: 256
     enc_in: 23
     embed: timeF
 
@@ -49,20 +49,20 @@ task_dataset:
     dataset: TUSL
     data: TUH
     root_path: /dataYYF/YYF/EEGdata
-    window_size: 1000
-    stride_size: 200
+    window_size: 2048
+    stride_size: 256
     enc_in: 23
     embed: timeF
 
-  TUSZtrain:
+  BCICIV:
     task_name: EEG_pretrain
-    dataset_name: TUSZtrain
-    dataset: TUSZ
-    data: TUH
+    dataset_name: BCICIV
+    dataset: BCICIV
+    data: BCICIV
     root_path: /dataYYF/YYF/EEGdata
-    window_size: 1000
-    stride_size: 200
-    enc_in: 23
+    window_size: 2048
+    stride_size: 256
+    enc_in: 59
     embed: timeF
 
 #  TUSZdev:
