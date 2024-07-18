@@ -83,23 +83,23 @@ class UnifiedMaskRecLoss(nn.Module):
 
     def forward_mim_loss(self, target, pred, pad_mask):
         loss = (pred - target) ** 2
-        loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
+        # loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
 
         combined_mask = pad_mask.bool()
 
         loss = (loss * combined_mask).sum() / combined_mask.sum()
         return loss
 
-    def forward(self, outputs, target, pad_mask):
-        student_cls, student_fore, _ = outputs
+    def forward(self, outputs, target):
+        _, student_fore, pad_mask = outputs
 
         mask_loss = self.forward_mim_loss(target, student_fore, pad_mask)
 
-        if student_cls is not None:
-            cls_loss = self.forward_mim_loss(target, student_cls, pad_mask)
-        else:
-            cls_loss = 0.0 * mask_loss
+        # if student_cls is not None:
+        #     cls_loss = self.forward_mim_loss(target, student_cls, pad_mask)
+        # else:
+        #     cls_loss = 0.0 * mask_loss
 
-        total_loss = dict(cls_loss=cls_loss,
-                          mask_loss=mask_loss, loss=mask_loss+cls_loss)
+        total_loss = dict(cls_loss=mask_loss,
+                          mask_loss=mask_loss, loss=mask_loss)
         return total_loss
