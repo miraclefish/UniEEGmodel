@@ -24,7 +24,7 @@ class EEGDataset(Dataset):
     """Read single hdf5 file regardless of label, subject, and paradigm."""
 
     def __init__(self, root_path: str, dataset_name: str, window_size: int = 200, stride_size: int = 1,
-                 start_percentage: float = 0, end_percentage: float = 1):
+                 start_percentage: float = 0, end_percentage: float = 1, try_run: bool = False):
         '''
         Extract ${dataset_name} from root_path.
 
@@ -40,11 +40,13 @@ class EEGDataset(Dataset):
         self.stride_size = stride_size
         self.start_percentage = start_percentage
         self.end_percentage = end_percentage
+        self.try_run = try_run
 
         self.file_path = Path(self.root_path) / f'{self.dataset_name}.hdf5'
         self.__file = None
         self.length = None
         self.feature_size = None
+        self.value_interval = None
 
         self.subjects = []
         self.global_idxes = []
@@ -56,10 +58,18 @@ class EEGDataset(Dataset):
         self.__file = h5py.File(str(self.file_path), 'r')
         self.subjects = [i for i in self.__file]
 
+        if self.try_run:
+            self.subjects = self.subjects[:5]
+
         global_idx = 0
+        # max_value_list = []
+        # min_value_list = []
         for subject in self.subjects:
             self.global_idxes.append(global_idx)  # the start index of the subject's sample in the dataset
-            subject_len = self.__file[subject]['eeg'].shape[1]
+            subject_len = self.__file[subject]['eeg'].shape[0]
+            # max_value, min_value = np.max(self.__file[subject]['eeg']), np.min(self.__file[subject]['eeg'])
+            # max_value_list.append(max_value)
+            # min_value_list.append(min_value)
             # total number of samples
             total_sample_num = (subject_len - self.window_size) // self.stride_size + 1
             # cut out part of samples
@@ -71,7 +81,10 @@ class EEGDataset(Dataset):
         self.length = global_idx
 
         self.feature_size = [i for i in self.__file[self.subjects[0]]['eeg'].shape]
-        self.feature_size[1] = self.window_size
+        self.feature_size[0] = self.window_size
+
+        # self.value_interval = (np.min(min_value_list), np.max(max_value_list))
+        self.value_interval = (0, 0)
 
     def __len__(self):
         return self.length
@@ -79,8 +92,10 @@ class EEGDataset(Dataset):
     def __getitem__(self, idx: int):
         subject_idx = bisect.bisect(self.global_idxes, idx) - 1
         item_start_idx = (idx - self.global_idxes[subject_idx]) * self.stride_size + self.local_idxes[subject_idx]
+        # data = np.clip(self.__file[self.subjects[subject_idx]]['eeg'][item_start_idx:item_start_idx + self.window_size] / 100, -5, 5)
+        data = self.__file[self.subjects[subject_idx]]['eeg'][item_start_idx:item_start_idx + self.window_size] / 100
         label = torch.tensor([0])
-        return self.__file[self.subjects[subject_idx]]['eeg'][:, item_start_idx:item_start_idx + self.window_size].T, label
+        return data, label
 
     def free(self) -> None:
         if self.__file:
