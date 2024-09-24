@@ -4,6 +4,7 @@ from gluonts.dataset.repository import get_dataset
 import os
 import h5py
 import bisect
+import random
 import numpy as np
 import pandas as pd
 import glob
@@ -19,6 +20,23 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
+SINGLE_LABEL_TO_MULTI_LABEL = {
+    0: [0,],
+    1: [1,],
+    2: [2,],
+    3: [3,],
+    4: [4,],
+    5: [5,],
+    6: [5,],
+    7: [1, 2],
+    8: [1, 3],
+    9: [1, 4],
+    10: [1, 5],
+    11: [2, 4],
+    12: [2, 5],
+    13: [3, 5],
+    14: [4, 5]
+}
 
 class EEGDataset(Dataset):
     """Read single hdf5 file regardless of label, subject, and paradigm."""
@@ -108,6 +126,205 @@ class EEGDataset(Dataset):
             pattern = r'\s(.*?)\-'
             ch_names = [re.search(pattern, ch).group(1) for ch in ch_names]
         return ch_names
+
+class TUARDataset(Dataset):
+    """Read single hdf5 file."""
+
+    def __init__(self, root_path: Path, dataset_name: str, window_size: int = 2048, stride_size: int = 256, clip: int = np.inf,
+                 norm_method: str = None, start_percentage: float = 0, end_percentage: float = 1,
+                 task: str = 'multi_cls', try_run: bool = False, flag: str = 'train', seed: int = 42):
+        '''
+        Extract datasets from file_path.
+
+        param Path file_path: the path of target data
+        param int window_size: the length of a single sample
+        param int stride_size: the interval between two adjacent samples
+        param float start_percentage: Index of percentage of the first sample of the dataset in the data file (inclusive)
+        param float end_percentage: Index of percentage of end of dataset sample in data file (not included)
+        '''
+        # self.__file_path = Path(root_path) / 'TUAR_train.hdf5' if flag == 'train' else Path(root_path) / 'TUAR_test.hdf5'
+        self.__file_path = root_path
+        self.flag = flag
+        self.seed = seed
+        self.__window_size = window_size
+        self.__stride_size = stride_size
+        self.__clip = clip
+        self.__norm_method = norm_method
+        self.__start_percentage = start_percentage
+        self.__end_percentage = end_percentage
+        self.__task = task
+        self.__try_run = try_run
+
+        self.__file = None
+        self.__length = None
+        self.__feature_size = None
+
+        self.__subjects = []
+        self.__global_idxes = []
+        self.__local_idxes = []
+        self.__subjects_data = []
+        self.__subjects_label = []
+
+        self.__init_dataset()
+
+    def random_idx(self):
+        idx_list = np.arange(len(self.__subjects))
+        random.seed(self.seed)
+        random.shuffle(idx_list)
+        if self.flag == 'train':
+            return idx_list[:int(len(self.__subjects) * 0.8)]
+        if self.flag == 'test':
+            return idx_list[int(len(self.__subjects) * 0.8):]
+
+
+    def __init_dataset(self) -> None:
+        self.__file = h5py.File(str(self.__file_path), 'r')
+        self.__subjects = [i for i in self.__file]
+        chosen_idx = self.random_idx()
+        self.__subjects = [subject for i, subject in enumerate(self.__subjects) if i in chosen_idx]
+
+        self.__feature_size = [i for i in self.__file[self.__subjects[0]]['eeg'].shape]
+        self.__feature_size[0] = self.__window_size
+
+        if self.__try_run:
+            self.__subjects = self.__subjects[:10]
+
+        global_idx = 0
+        for subject in self.__subjects:
+            self.__global_idxes.append(global_idx)  # the start index of the subject's sample in the dataset
+            subject_len = self.__file[subject]['eeg'].shape[0]
+
+            data = self.preprocess_data(subject)
+            label = self.label_parsing(subject)
+            self.__subjects_data.append(data)
+            self.__subjects_label.append(label)
+
+            # total number of samples
+            total_sample_num = (subject_len - self.__window_size) // self.__stride_size + 1
+            # cut out part of samples
+            start_idx = int(total_sample_num * self.__start_percentage) * self.__stride_size
+            end_idx = int(total_sample_num * self.__end_percentage - 1) * self.__stride_size
+
+            self.__local_idxes.append(start_idx)
+            global_idx += (end_idx - start_idx) // self.__stride_size + 1
+        self.__length = global_idx
+        # self.free()
+
+    @property
+    def feature_size(self):
+        return self.__feature_size
+
+    @property
+    def subject_num(self):
+        return len(self.__subjects)
+
+    @property
+    def subject_list(self):
+        return self.__subjects
+
+    def __len__(self):
+        return self.__length
+
+    def __getitem__(self, idx: int):
+        subject_idx = bisect.bisect(self.__global_idxes, idx) - 1
+
+        item_start_idx = (idx - self.__global_idxes[subject_idx]) * self.__stride_size + self.__local_idxes[subject_idx]
+        # data = self.__file[self.__subjects[subject_idx]]['eeg'][:, item_start_idx:item_start_idx + self.__window_size]
+        data = self.__subjects_data[subject_idx][item_start_idx:item_start_idx + self.__window_size, :] / 100
+        label = self.__subjects_label[subject_idx][item_start_idx:item_start_idx + self.__window_size, :]
+        if self.flag == 'train':
+            return data, label
+        if self.flag == 'test':
+            window_idx = idx - self.__global_idxes[subject_idx]  # the index of the sample in the subject
+            return data, label, subject_idx, window_idx
+
+    def get_event_labels(self, subject_idx: int):
+        label_table = self.__file[self.__subjects[subject_idx]]['eeg'].attrs['labelChannel']
+        label_table = pd.DataFrame(label_table, columns=['#Channel', 'start', 'end', 'label'])
+        label_table['#Channel'] = label_table['#Channel'].apply(self.int_coding_to_multi_channel)
+        return label_table
+
+    def check_subject_idx(self, idx: list):
+        subject_idx = [bisect.bisect(self.__global_idxes, i) - 1 for i in idx]
+        return subject_idx
+
+    def get_subject_name(self, idx: int):
+        return self.__subjects[idx]
+
+    def get_subject_length(self, idx):
+        return self.__file[self.__subjects[idx]]['eeg'][:].shape[1]
+
+    def preprocess_data(self, subject):
+        data = self.__file[subject]['eeg'][:]
+        # TODO 记得删除
+        # data = np.concatenate([data, np.zeros((data.shape[0], 1))], axis=1)
+        # if self.__clip != np.inf:
+        #     data = np.clip(data, -self.__clip, self.__clip)
+        #     data = self.norm_data(data)
+        return torch.from_numpy(data)
+
+    def norm_data(self, data):
+        if self.__norm_method in [None, '']:
+            return data
+        elif self.__norm_method == 'mm_scaling':
+            return data / self.__clip
+        elif self.__norm_method == 'z_score_scaling':
+            return (data - np.mean(data, axis=-1, keepdims=True)) / np.std(data, axis=-1, keepdims=True)
+
+    def label_parsing(self, subject):
+
+        length = self.__file[subject]['eeg'].shape[0]
+        label_table = self.__file[subject]['eeg'].attrs['labelChannel']
+        channel_index, label_index = label_table[:, 0], label_table[:, 3]
+        start_index, stop_index = label_table[:, 1], label_table[:, 2]
+
+        if self.__task == 'binary_cls':
+
+            # label : [N, T]
+            label = np.zeros((self.__feature_size[0], length, 1))
+            for idx in range(len(start_index)):
+                c = channel_index[idx]
+                start = start_index[idx]
+                stop = stop_index[idx]
+                channel_list = self.int_coding_to_multi_channel(c)
+                for channel_id in channel_list:
+                    label[channel_id, start:stop] = 1
+
+        if self.__task == 'multi_cls':
+
+            # label : [N, T, num_class]
+            label = np.zeros((22, length, 6))
+            for idx in range(len(start_index)):
+                c = channel_index[idx]
+                l = label_index[idx]
+                start = start_index[idx]
+                stop = stop_index[idx]
+                channel_list = self.int_coding_to_multi_channel(c)
+                for channel_id in channel_list:
+                    for ll in SINGLE_LABEL_TO_MULTI_LABEL[l]:
+                        label[channel_id, start:stop, ll] = 1
+                        label[channel_id, start:stop, 0] = 1
+
+            label = label.transpose((1, 0, 2))
+            # TODO 记得删除
+            # label = np.concatenate([label, np.zeros((label.shape[0], 1, label.shape[2]))], axis=1)
+        return torch.from_numpy(label)
+
+    def int_coding_to_multi_channel(self, x):
+        # 将整数转换为二进制字符串，去掉前缀'0b'，并填充零直到达到指定长度
+        binary_str = format(x, 'b').zfill(22)
+
+        # 找到1对应的索引，即为有标注的通道
+        indices = [index for index, bit in enumerate(binary_str) if bit == '1']
+        return indices
+
+    def free(self) -> None:
+        if self.__file:
+            self.__file.close()
+            self.__file = None
+
+    def get_ch_names(self):
+        return self.__file[self.__subjects[0]]['eeg'].attrs['chOrder']
 
 
 class Dataset_ETT_hour(Dataset):
