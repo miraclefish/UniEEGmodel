@@ -194,14 +194,17 @@ class Exp_All_Task(object):
                 if self.args.wandb:
                     wandb.log({'train_loss_avg': train_loss})
 
-                save_dict = {
-                    'student': self.model.state_dict(),
-                    'optimizer': model_optim.state_dict(),
-                    'epoch': epoch + 1,
-                    'args': self.args,
-                }
+                if np.isnan(train_loss):
+                    break
+                else:
+                    save_dict = {
+                        'student': self.model.state_dict(),
+                        'optimizer': model_optim.state_dict(),
+                        'epoch': epoch + 1,
+                        'args': self.args,
+                    }
 
-                torch.save(save_dict, path + '/' + 'pretrain_checkpoint.pth')
+                    torch.save(save_dict, path + '/' + 'pretrain_checkpoint.pth')
 
         return self.model
 
