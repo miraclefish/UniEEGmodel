@@ -6,10 +6,10 @@ from utils.losses import mape_loss, mase_loss, smape_loss
 from utils.dataloader import BalancedDataLoaderIterator
 from utils.layer_decay import param_groups_lrd
 from utils.ddp import get_world_size, is_main_process, gather_tensors_from_all_gpus
+from utils.evaluator import BASE_metrics_calc, EACS_metrics_calc
 
 from sklearn.metrics import precision_recall_fscore_support
 from sklearn.metrics import accuracy_score
-
 
 import torch
 import torch.nn as nn
@@ -19,6 +19,7 @@ import torch.distributed as dist
 import os
 import time
 import warnings
+import json
 import numpy as np
 import yaml
 import wandb
@@ -111,14 +112,14 @@ def change_config_list_pred_len(task_data_config_list, task_data_config, offset)
     new_task_data_config = copy.deepcopy(task_data_config)
     new_task_data_config_list = copy.deepcopy(task_data_config_list)
     for task_name, task_config in new_task_data_config.items():
-        if task_config['task_name']=='long_term_forecast':
-            new_task_data_config[task_name]['pred_len']+=offset
+        if task_config['task_name'] == 'long_term_forecast':
+            new_task_data_config[task_name]['pred_len'] += offset
         else:
             del new_task_data_config[task_name]
 
     for each_config in new_task_data_config_list:
-        if each_config[1]['task_name'] =='long_term_forecast':
-            each_config[1]['pred_len']+=offset
+        if each_config[1]['task_name'] == 'long_term_forecast':
+            each_config[1]['pred_len'] += offset
         else:
             del each_config
 
@@ -136,9 +137,49 @@ def get_loss_by_name(loss_name):
         return smape_loss()
     elif loss_name == 'CE':
         return nn.CrossEntropyLoss()
+    elif loss_name == 'DICE':
+        return DiceLoss(weights=True)
     else:
         print("no loss function found!")
         exit()
+
+
+class DiceLoss(nn.Module):
+    def __init__(self, weights=False):
+        super(DiceLoss, self).__init__()
+        self.weights = weights
+        # self.w = torch.tensor([0.8250, 0.0465, 0.0134, 0.0006, 0.1109, 0.0463])
+        self.w = 1 - torch.tensor([0.181, 0.953, 0.985, 0.999, 0.893, 0.937])
+        self.w = (self.w / self.w.sum()) * 6
+
+    def forward(self, input, target):
+
+        num_classes = input.size(-1)
+        # Reshape input and target tensors
+        input = input.reshape(-1, num_classes)
+        target = target.reshape(-1, num_classes)
+
+        # Compute intersection and union
+        intersection = torch.sum(input * target, dim=0)
+        union = torch.sum(input + target, dim=0)
+
+        # Compute class-wise Dice scores
+        dice_scores = (2 * intersection) / (union + 1e-8)
+
+        if num_classes > 1:
+            if not self.weights:
+                weighted_dice_scores = dice_scores
+            else:
+                # Apply class weights
+                # print('Dice loss weight:', self.w)
+                weighted_dice_scores = dice_scores * self.w.to(target.device)
+        else:
+            weighted_dice_scores = dice_scores
+
+        # Compute the overall Weighted Dice Loss
+        loss = 1 - torch.mean(weighted_dice_scores)
+
+        return loss
 
 
 def init_and_merge_datasets(data_loader_list):
@@ -148,10 +189,11 @@ def init_and_merge_datasets(data_loader_list):
 
 
 class Exp_All_Task(object):
-    def __init__(self, args):
+    def __init__(self, args, logger=None):
         super(Exp_All_Task, self).__init__()
 
         self.args = args
+        self.logger = logger
         self.ori_task_data_config = read_task_data_config(
             self.args.task_data_config_path)
         self.ori_task_data_config_list = get_task_data_config_list(
@@ -159,32 +201,43 @@ class Exp_All_Task(object):
 
         if self.args.zero_shot_forecasting_new_length is not None:
             print("Change the forecasting len!")
-            self.task_data_config_list, self.task_data_config = change_config_list_pred_len(self.ori_task_data_config_list, self.ori_task_data_config, self.args.offset)
+            self.task_data_config_list, self.task_data_config = change_config_list_pred_len(
+                self.ori_task_data_config_list, self.ori_task_data_config, self.args.offset)
         else:
             self.task_data_config = self.ori_task_data_config
             self.task_data_config_list = self.ori_task_data_config_list
-        device_id = dist.get_rank() % torch.cuda.device_count()
+        if args.ddp:
+            device_id = dist.get_rank() % torch.cuda.device_count()
+        else:
+            device_id = args.device
+
+        if self.logger:
+            self.logger.info(f"this device_id: {device_id}")
         self.device_id = device_id
-        print("device id", self.device_id)
+
         self.model = self._build_model()
 
-    def _build_model(self, ddp=True):
+    def _build_model(self):
+        ddp = self.args.ddp
         import importlib
-        module = importlib.import_module("models."+self.args.model)
+        module = importlib.import_module("models." + self.args.model)
         model = module.Model(
             self.args, self.task_data_config_list).to(self.device_id)
         if ddp:
             model = nn.parallel.DistributedDataParallel(model, device_ids=[self.device_id],
-                                                        find_unused_parameters=True, gradient_as_bucket_view=True, static_graph=False)
+                                                        find_unused_parameters=True, gradient_as_bucket_view=True,
+                                                        static_graph=False)
         return model
 
     def _get_data(self, flag, test_anomaly_detection=False):
         if self.args.zero_shot_forecasting_new_length is not None:
-            _, max_offset_task_data_config = change_config_list_pred_len(self.ori_task_data_config_list, self.ori_task_data_config, self.args.max_offset)
+            _, max_offset_task_data_config = change_config_list_pred_len(self.ori_task_data_config_list,
+                                                                         self.ori_task_data_config,
+                                                                         self.args.max_offset)
             this_task_data_config = max_offset_task_data_config
         else:
             this_task_data_config = self.task_data_config
-            
+
         data_set_list = []
         data_loader_list = []
 
@@ -202,7 +255,7 @@ class Exp_All_Task(object):
                 print(task_data_name, len(data_set))
             else:
                 data_set, data_loader = data_provider(
-                    self.args, task_config, flag, ddp=True)
+                    self.args, task_config, flag, ddp=self.args.ddp)
                 data_set_list.append(data_set)
                 data_loader_list.append(data_loader)
                 print(task_data_name, len(data_set))
@@ -245,6 +298,8 @@ class Exp_All_Task(object):
                     loss_name = 'MSE'
                 elif each_config[1]['task_name'] == 'anomaly_detection':
                     loss_name = 'MSE'
+                elif 'segmentation' in each_config[1]['task_name']:
+                    loss_name = 'DICE'
                 else:
                     print("this task has no loss now!", folder=self.path)
                     exit()
@@ -255,7 +310,7 @@ class Exp_All_Task(object):
     def choose_training_parts(self, prompt_tune=False):
         for name, param in self.model.named_parameters():
             if prompt_tune:
-                if 'prompt_token' in name or 'mask_prompt' in name or 'cls_prompt' in name or 'mask_token' in name or 'cls_token' in name or 'category_token' in name:
+                if 'prompt_token' in name or 'mask_prompt' in name or 'cls_prompt' in name or 'mask_token' in name or 'cls_token' in name or 'category_token' in name or 'mask_token' in name:
                     param.requires_grad = True
                     print("trainable:", name)
                 else:
@@ -279,8 +334,8 @@ class Exp_All_Task(object):
                     self.path, 'pretrain_checkpoint.pth')
             else:
                 pretrain_weight_path = self.args.pretrained_weight
-            print('loading pretrained model:',
-                  pretrain_weight_path, folder=self.path)
+            if is_main_process():
+                self.logger.info(f'loading pretrained model:{pretrain_weight_path}')
             if 'pretrain_checkpoint.pth' in pretrain_weight_path:
                 state_dict = torch.load(
                     pretrain_weight_path, map_location='cpu')['student']
@@ -291,7 +346,7 @@ class Exp_All_Task(object):
             else:
                 ckpt = torch.load(pretrain_weight_path, map_location='cpu')
             msg = self.model.load_state_dict(ckpt, strict=False)
-            print(msg, folder=self.path)
+            # print(msg, folder=self.path)
 
         # Data
         _, train_loader_list = self._get_data(flag='train')
@@ -303,18 +358,19 @@ class Exp_All_Task(object):
 
         # Model param check
         pytorch_total_params = sum(p.numel() for p in self.model.parameters())
-        print("Parameters number for all {} M".format(
-            pytorch_total_params/1e6), folder=self.path)
+        if is_main_process():
+            self.logger.info(f"Parameters number for all {pytorch_total_params / 1e6} M")
         model_param = []
         for name, param in self.model.named_parameters():
             if ('prompts' in name and 'prompt2forecat' not in name) or 'prompt_token' in name or \
-                'mask_prompt' in name or 'cls_prompt' in name or 'mask_token' in name or 'cls_token' in name or 'category_token' in name:
-                print('skip this:', name)
+                    'mask_prompt' in name or 'cls_prompt' in name or 'mask_token' in name or 'cls_token' in name or 'category_token' in name:
+                if is_main_process():
+                    self.logger.info(f'skip this: {name}')
             else:
                 model_param.append(param.numel())
         model_total_params = sum(model_param)
-        print("Parameters number for UniTS {} M".format(
-            model_total_params/1e6), folder=self.path)
+        if is_main_process():
+            self.logger.info(f"Parameters number for UniTS {model_total_params / 1e6} M")
 
         # Optimizer and Criterion
         model_optim = self._select_optimizer()
@@ -325,14 +381,16 @@ class Exp_All_Task(object):
         if self.args.memory_check:
             self.memory_check(data_loader_cycle, criterion_list)
             torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        dist.barrier()
 
-        for epoch in range(self.args.train_epochs+self.args.prompt_tune_epoch):
+        if self.args.ddp:
+            torch.cuda.synchronize()
+            dist.barrier()
+
+        for epoch in range(self.args.train_epochs + self.args.prompt_tune_epoch):
             adjust_learning_rate(model_optim, epoch,
                                  self.real_learning_rate, self.args)
             # Prompt learning
-            if (epoch+1) <= self.args.prompt_tune_epoch:
+            if (epoch + 1) <= self.args.prompt_tune_epoch:
                 self.choose_training_parts(prompt_tune=True)
             else:
                 self.choose_training_parts(prompt_tune=False)
@@ -341,7 +399,7 @@ class Exp_All_Task(object):
                 model_optim, data_loader_cycle, criterion_list, epoch, train_steps, scaler)
 
             # we report the results of last epoch and not find the best epoch based on val set, since some datasets do not have val set
-            avg_cls_acc, avg_forecast_mse, avg_forecast_mae = self.test(
+            metrics = self.test(
                 setting, load_pretrain=False, test_data_list=test_data_list, test_loader_list=test_loader_list)
 
             # save ckpt
@@ -353,11 +411,15 @@ class Exp_All_Task(object):
                     torch.save(self.model.state_dict(),
                                os.path.join(path, 'checkpoint.pth'))
 
-        if is_main_process():
-            wandb.log({'Final_LF-mse': avg_forecast_mse,
-                       'Final_LF-mae': avg_forecast_mae, 'Final_CLS-acc': avg_cls_acc})
-            print("Final score: LF-mse: {}, LF-mae: {}, CLS-acc {}".format(avg_forecast_mse,
-                                                                           avg_forecast_mae, avg_cls_acc), folder=self.path)
+        # if is_main_process():
+        #     avg_base_f1 = np.average(metrics['BASE_metrics']['f1_score'].values()[1:])
+        #     avg_eacs_f1 = np.average(metrics['EACS_metrics']['f1_score'].values()[1:])
+        #     wandb.log({'Final-Avg-BASE-f1_' + data_task_name: avg_base_f1})
+        #     wandb.log({'Final-Avg-EACS-f1_' + data_task_name: avg_eacs_f1})
+        #     wandb.log({'Final_LF-mse': avg_forecast_mse,
+        #                'Final_LF-mae': avg_forecast_mae, 'Final_CLS-acc': avg_cls_acc})
+        #     print("Final score: LF-mse: {}, LF-mae: {}, CLS-acc {}".format(avg_forecast_mse,
+        #                                                                    avg_forecast_mae, avg_cls_acc), folder=self.path)
 
         return self.model
 
@@ -402,19 +464,24 @@ class Exp_All_Task(object):
                     loss = self.train_anomaly_detection(
                         self.model, sample, criterion_list[task_id], self.task_data_config_list[task_id][1], task_id)
                     loss_scale = 1.0
+                elif task_name == 'EEG_segmentation':
+                    loss = self.train_segmentation(
+                        self.model, sample, criterion_list[task_id], self.task_data_config_list[task_id][1], task_id)
+                    loss_scale = 1.0
 
                 loss /= acc_it
                 loss /= len_sample_list
-                if sample_idx < len_sample_list-1:
-                    norm_value = scaler(loss*loss_scale, model_optim, clip_grad=max_norm,
+                if sample_idx < len_sample_list - 1:
+                    norm_value = scaler(loss * loss_scale, model_optim, clip_grad=max_norm,
                                         parameters=self.model.parameters(), create_graph=False, update_grad=False)
-            loss_display = loss.item()*len_sample_list*acc_it
+            loss_display = loss.item() * len_sample_list * acc_it
             train_loss_set.append(loss_display)
 
-            norm_value = scaler(loss*loss_scale, model_optim, clip_grad=max_norm,
-                                parameters=self.model.parameters(), create_graph=False, update_grad=((i + 1) % acc_it == 0))
+            norm_value = scaler(loss * loss_scale, model_optim, clip_grad=max_norm,
+                                parameters=self.model.parameters(), create_graph=False,
+                                update_grad=((i + 1) % acc_it == 0))
 
-            if (i+1) % acc_it == 0:
+            if (i + 1) % acc_it == 0:
                 model_optim.zero_grad()
             torch.cuda.synchronize()
 
@@ -423,27 +490,48 @@ class Exp_All_Task(object):
 
             del sample_init
             del sample_list
-            if torch.cuda.memory_reserved(current_device) > 30*1e9:
+            if torch.cuda.memory_reserved(current_device) > 30 * 1e9:
                 torch.cuda.empty_cache()
 
             if is_main_process():
-                wandb.log(
-                    {'train_loss_'+self.task_data_config_list[task_id][0]: loss_display, 'norm_value': norm_value, "loss_sum": loss_sum_display/(i+1)})
+                wandb_loss_dict = {
+                    f'train_loss_{self.task_data_config_list[task_id][0]}': loss_display,
+                    'norm_value': norm_value,
+                    'loss_sum': loss_sum_display / (i + 1)
+                }
+                if self.args.wandb:
+                    wandb.log(wandb_loss_dict)
 
-            if (i + 1) % 100 == 0:
-                if norm_value == None:
+            if (i + 1) % 100 == 0 and is_main_process():
+                if norm_value is None:
                     norm_value = -1
-                if is_main_process():
-                    print("\titers: {0}, epoch: {1} | norm: {2:.2f} | loss: {3:.7f} | current_loss: {4} |current task: {5}".format(
-                        i + 1, epoch + 1, norm_value, loss_sum_display/(i+1), loss_display, task_name, folder=self.path))
+                self.logger.info(
+                    f"\titers: {i + 1}, epoch: {epoch + 1} | norm: {norm_value:.2f} | loss: {loss_sum_display / (i + 1):.7f} | current_loss: {loss_display:.7f} |current task: {task_name}")
 
-        print("Epoch: {} cost time: {}".format(
-            epoch + 1, time.time() - epoch_time), folder=self.path)
+        if is_main_process():
+            self.logger.info(f"Epoch: {epoch + 1} cost time: {time.time() - epoch_time}")
         train_loss = np.average(train_loss_set)
-        torch.cuda.synchronize()
-        dist.barrier()
+
+        if self.args.ddp:
+            torch.cuda.synchronize()
+            dist.barrier()
 
         return train_loss
+
+    def train_segmentation(self, model, this_batch, criterion, config, task_id):
+
+        task_name = config['task_name']
+
+        batch_x, batch_y = this_batch
+
+        batch_x = batch_x.float().to(self.device_id)
+        batch_y = batch_y.float().to(self.device_id)
+
+        with torch.cuda.amp.autocast():
+            outputs = model(batch_x, None, task_id=task_id, task_name=task_name)
+            loss = criterion(outputs, batch_y)
+
+        return loss
 
     def train_long_term_forecast(self, model, this_batch, criterion, config, task_id):
         label_len = config['label_len']
@@ -485,7 +573,7 @@ class Exp_All_Task(object):
             if outputs.shape[0] == label.shape[0]:
                 loss = criterion(outputs, label.long().squeeze(-1))
             else:
-                label = label.repeat(outputs.shape[0]//label.shape[0], 1)
+                label = label.repeat(outputs.shape[0] // label.shape[0], 1)
                 loss = criterion(outputs, label.long().squeeze(-1))
 
         return loss
@@ -527,8 +615,8 @@ class Exp_All_Task(object):
 
         return loss
 
-
     def test(self, setting, load_pretrain=False, test_data_list=None, test_loader_list=None):
+
         self.path = os.path.join(self.args.checkpoints, setting)
         if not os.path.exists(self.path) and is_main_process():
             os.makedirs(self.path)
@@ -566,7 +654,7 @@ class Exp_All_Task(object):
             task_name = self.task_data_config_list[task_id][1]['task_name']
             data_task_name = self.task_data_config_list[task_id][0]
             if task_name == 'long_term_forecast':
-                if self.args.zero_shot_forecasting_new_length=='unify':
+                if self.args.zero_shot_forecasting_new_length == 'unify':
                     mse, mae = self.test_long_term_forecast_offset_unify(
                         setting, test_data, test_loader, data_task_name, task_id)
                 else:
@@ -575,8 +663,8 @@ class Exp_All_Task(object):
                 data_task_name = self.task_data_config_list[task_id][0]
                 total_dict[data_task_name] = {'mse': mse, 'mae': mae}
                 if is_main_process():
-                    wandb.log({'eval_LF-mse_'+data_task_name: mse})
-                    wandb.log({'eval_LF-mae_'+data_task_name: mae})
+                    wandb.log({'eval_LF-mse_' + data_task_name: mse})
+                    wandb.log({'eval_LF-mae_' + data_task_name: mae})
                 avg_long_term_forecast_mse.append(mse)
                 avg_long_term_forecast_mae.append(mae)
             elif task_name == 'classification':
@@ -584,15 +672,15 @@ class Exp_All_Task(object):
                     setting, test_data, test_loader, data_task_name, task_id)
                 total_dict[data_task_name] = {'acc': acc}
                 if is_main_process():
-                    wandb.log({'eval_CLS-acc_'+data_task_name: acc})
+                    wandb.log({'eval_CLS-acc_' + data_task_name: acc})
                 avg_classification_acc.append(acc)
             elif task_name == 'imputation':
                 mse, mae = self.test_imputation(
                     setting, test_data, test_loader, data_task_name, task_id)
                 total_dict[data_task_name] = {'mse': mse, 'mae': mae}
                 if is_main_process():
-                    wandb.log({'eval_Imputation-mse_'+data_task_name: mse})
-                    wandb.log({'eval_Imputation-mae_'+data_task_name: mae})
+                    wandb.log({'eval_Imputation-mse_' + data_task_name: mse})
+                    wandb.log({'eval_Imputation-mae_' + data_task_name: mae})
                 avg_imputation_mse.append(mse)
                 avg_imputation_mae.append(mae)
             elif task_name == 'anomaly_detection':
@@ -601,28 +689,108 @@ class Exp_All_Task(object):
                 total_dict[data_task_name] = {'f_score': f_score}
                 if is_main_process():
                     wandb.log({'eval_Anomaly-f_score_' +
-                              data_task_name: f_score})
+                               data_task_name: f_score})
                 avg_anomaly_f_score.append(f_score)
+            elif task_name == 'EEG_segmentation':
+                metrics = self.test_segmentation(
+                    setting, test_data, test_loader, data_task_name, task_id)
+                total_dict[data_task_name] = {'metrics': metrics}
+                if is_main_process() and self.args.wandb:
+                    wandb.log(metrics['BASE_metrics']['precision'])
+                    wandb.log(metrics['BASE_metrics']['recall'])
+                    wandb.log(metrics['BASE_metrics']['f1_score'])
+                    wandb.log(metrics['EACS_metrics']['precision'])
+                    wandb.log(metrics['EACS_metrics']['recall'])
+                    wandb.log(metrics['EACS_metrics']['f1_score'])
+                    avg_base_f1 = np.average(np.array(list(metrics['BASE_metrics']['f1_score'].values()))[1:])
+                    avg_eacs_f1 = np.average(np.array(list(metrics['EACS_metrics']['f1_score'].values()))[1:])
+                    wandb.log({'eval_Seg-Avg-BASE-f1_' + data_task_name: avg_base_f1})
+                    wandb.log({'eval_Seg-Avg-EACS-f1_' + data_task_name: avg_eacs_f1})
 
-        avg_long_term_forecast_mse = np.average(avg_long_term_forecast_mse)
-        avg_long_term_forecast_mae = np.average(avg_long_term_forecast_mae)
+        # avg_long_term_forecast_mse = np.average(avg_long_term_forecast_mse)
+        # avg_long_term_forecast_mae = np.average(avg_long_term_forecast_mae)
+        #
+        # avg_classification_acc = np.average(avg_classification_acc)
+        #
+        # avg_imputation_mse = np.average(avg_imputation_mse)
+        # avg_imputation_mae = np.average(avg_imputation_mae)
+        #
+        # avg_anomaly_f_score = np.average(avg_anomaly_f_score)
 
-        avg_classification_acc = np.average(avg_classification_acc)
-
-        avg_imputation_mse = np.average(avg_imputation_mse)
-        avg_imputation_mae = np.average(avg_imputation_mae)
-
-        avg_anomaly_f_score = np.average(avg_anomaly_f_score)
-
+        # if is_main_process():
+        #     wandb.log({'avg_eval_LF-mse': avg_long_term_forecast_mse, 'avg_eval_LF-mae': avg_long_term_forecast_mae,
+        #                'avg_eval_CLS-acc': avg_classification_acc,
+        #                'avg_eval_IMP-mse': avg_imputation_mse, 'avg_eval_IMP-mae': avg_imputation_mae,
+        #                'avg_eval_Anomaly-f_score': avg_anomaly_f_score})
+        #     print("Avg score: LF-mse: {}, LF-mae: {}, CLS-acc {}, IMP-mse: {}, IMP-mae: {}, Ano-F: {}".format(avg_long_term_forecast_mse,
+        #                                                                                                       avg_long_term_forecast_mae, avg_classification_acc, avg_imputation_mse, avg_imputation_mae, avg_anomaly_f_score), folder=self.path)
+        #     print(total_dict, folder=self.path)
         if is_main_process():
-            wandb.log({'avg_eval_LF-mse': avg_long_term_forecast_mse, 'avg_eval_LF-mae': avg_long_term_forecast_mae,
-                       'avg_eval_CLS-acc': avg_classification_acc,
-                       'avg_eval_IMP-mse': avg_imputation_mse, 'avg_eval_IMP-mae': avg_imputation_mae,
-                       'avg_eval_Anomaly-f_score': avg_anomaly_f_score})
-            print("Avg score: LF-mse: {}, LF-mae: {}, CLS-acc {}, IMP-mse: {}, IMP-mae: {}, Ano-F: {}".format(avg_long_term_forecast_mse,
-                                                                                                              avg_long_term_forecast_mae, avg_classification_acc, avg_imputation_mse, avg_imputation_mae, avg_anomaly_f_score), folder=self.path)
-            print(total_dict, folder=self.path)
-        return avg_classification_acc, avg_long_term_forecast_mse, avg_long_term_forecast_mae
+            self.logger.info(
+                f"{data_task_name} eval_Seg-ART-BASE-f1: {list(metrics['BASE_metrics']['f1_score'].values())[0]:.6f}")
+            self.logger.info(
+                f"{data_task_name} eval_Seg-ART-EACS-f1: {list(metrics['EACS_metrics']['f1_score'].values())[0]:.6f}")
+            avg_base_f1 = np.average(np.array(list(metrics['BASE_metrics']['f1_score'].values()))[1:])
+            avg_eacs_f1 = np.average(np.array(list(metrics['EACS_metrics']['f1_score'].values()))[1:])
+            self.logger.info(f"{data_task_name} eval_Seg-Avg-BASE-f1: {avg_base_f1:.6f}")
+            self.logger.info(f"{data_task_name} eval_Seg-Avg-EACS-f1: {avg_eacs_f1:.6f}")
+
+        return metrics
+
+    def test_segmentation(self, setting, test_data, test_loader, data_task_name, task_id):
+        preds = []
+        trues = []
+        subject_ids = []
+        window_ids = []
+        self.model.eval()
+        with torch.no_grad():
+            for i, (batch_x, label, subject_id, window_id) in enumerate(test_loader):
+                batch_x = batch_x.float().to(self.device_id)
+                label = label.to(self.device_id)
+
+                outputs = self.model(batch_x, None, task_id=task_id, task_name='segmentation')
+
+                predictions = (outputs > 0.5).int()
+                preds.append(predictions.detach())
+                trues.append(label)
+                subject_ids.append(subject_id)
+                window_ids.append(window_id)
+
+        if self.args.ddp and is_main_process():
+
+            preds = gather_tensors_from_all_gpus(
+                preds, self.device_id, to_numpy=False)
+            # print(f"XXXXXXXXXXXXXXFinish tt")
+            trues = gather_tensors_from_all_gpus(
+                trues, self.device_id, to_numpy=False)
+            subject_ids = gather_tensors_from_all_gpus(
+                subject_ids, self.device_id, to_numpy=False)
+            window_ids = gather_tensors_from_all_gpus(
+                window_ids, self.device_id, to_numpy=False)
+
+            preds = torch.cat(preds, 0)
+            trues = torch.cat(trues, 0)
+            subject_ids = torch.cat(subject_ids, 0)
+            window_ids = torch.cat(window_ids, 0)
+
+            predictions = preds.cpu().numpy()
+            trues = trues.cpu().numpy()
+            subject_ids = subject_ids.cpu().numpy()
+            window_ids = window_ids.cpu().numpy()
+
+            BASE_metrics = BASE_metrics_calc(predictions, trues)
+            EACS_metrics = EACS_metrics_calc(predictions, trues, subject_ids, window_ids)
+
+            del predictions
+            del trues
+            torch.cuda.empty_cache()
+
+            self.logger.info(f"dataset name: {data_task_name} | Test finished.")
+        else:
+            BASE_metrics = None
+            EACS_metrics = None
+
+        return {'BASE_metrics': BASE_metrics, 'EACS_metrics': EACS_metrics}
 
     def test_long_term_forecast(self, setting, test_data, test_loader, data_task_name, task_id):
         config = self.task_data_config_list[task_id][1]
@@ -834,7 +1002,7 @@ class Exp_All_Task(object):
         config = self.task_data_config_list[task_id][1]
         pred_len = config['pred_len']
         features = config['features']
-        max_pred_len = pred_len-self.args.offset+self.args.max_offset
+        max_pred_len = pred_len - self.args.offset + self.args.max_offset
 
         preds = []
         trues = []
@@ -843,7 +1011,7 @@ class Exp_All_Task(object):
             for i, (batch_x, batch_y, _, _) in enumerate(test_loader):
                 batch_x = batch_x.float().to(self.device_id)
                 batch_y = batch_y.float().to(self.device_id)
-                batch_y = batch_y[:,-max_pred_len:][:,:pred_len]
+                batch_y = batch_y[:, -max_pred_len:][:, :pred_len]
 
                 dec_inp = None
                 batch_x_mark = None
@@ -884,6 +1052,7 @@ class Exp_All_Task(object):
     def split_batch(self, batch, small_batch_size, task_name):
         def split_tensor(tensor, size):
             return [tensor[i:min(i + size, tensor.size(0))] for i in range(0, tensor.size(0), size)]
+
         if task_name == 'classification':
             batch_x, label, padding_mask = batch
             split_batch_x = split_tensor(batch_x, small_batch_size)
@@ -902,6 +1071,11 @@ class Exp_All_Task(object):
             split_batch_x = split_tensor(batch_x, small_batch_size)
             split_batch_y = split_tensor(batch_y, small_batch_size)
             return list(zip(split_batch_x, split_batch_y))
+        elif task_name == 'EEG_segmentation':
+            batch_x, label = batch
+            split_batch_x = split_tensor(batch_x, small_batch_size)
+            split_label = split_tensor(label, small_batch_size)
+            return list(zip(split_batch_x, split_label))
 
     def memory_check(self, data_loader_cycle, criterion_list, holdout_memory=3):
         """
@@ -918,23 +1092,23 @@ class Exp_All_Task(object):
         extra_mem = torch.empty(
             num_elements, dtype=torch.float32, device=self.device_id)
 
-        model_tmp = self._build_model(ddp=False)
-        model_tmp.train()
-        model_tmp.zero_grad(set_to_none=True)
-
         for data_loader_id in range(data_loader_cycle.num_dataloaders):
             batch_size = 1  # Initial batch size
             max_batch_size = 0  # Record the maximum batch size before OOM
-            torch.cuda.synchronize()
+
+            if self.args.ddp:
+                torch.cuda.synchronize()
+
+            model_tmp = self._build_model()
+            model_tmp.train()
             model_tmp.zero_grad(set_to_none=True)
             while True:
                 try:
                     sample, task_id = data_loader_cycle.generate_fake_samples_for_batch(
                         data_loader_id, batch_size)  # 2 makes the memory larger
                     task_name = self.task_data_config_list[task_id][1]['task_name']
+                    dataset_name = self.task_data_config_list[task_id][1]['dataset']
                     # Try running the function with the current batch size
-                    print(task_id, task_name,
-                          sample[0].shape, "max batch size", max_batch_size)
                     if task_name == 'long_term_forecast':
                         loss = self.train_long_term_forecast(
                             model_tmp, sample, criterion_list[task_id], self.task_data_config_list[task_id][1], task_id)
@@ -947,29 +1121,56 @@ class Exp_All_Task(object):
                     elif task_name == 'anomaly_detection':
                         loss = self.train_anomaly_detection(
                             model_tmp, sample, criterion_list[task_id], self.task_data_config_list[task_id][1], task_id)
-                    loss = loss * 0.0
+                    elif task_name == 'EEG_segmentation':
+                        loss = self.train_segmentation(
+                            model_tmp, sample, criterion_list[task_id], self.task_data_config_list[task_id][1], task_id)
+                    if is_main_process():
+                        self.logger.info(
+                            f"task_id: {task_id}, dataset_name: {dataset_name}, sample_shape: {sample[0].shape}, max_batch_size: {max_batch_size}")
+                    # with torch.cuda.amp.autocast():
+                    #     model_output = model_tmp(
+                    #         sample[0], None, task_id=task_id, task_name=task_name)
+
+                    # loss = 0.0
+                    # # 直接进行backward，测试最大训练内存容量
+                    # for each in model_output:
+                    #     if each is not None:
+                    #         # 如果是list，就对每个元素求和
+                    #         if isinstance(each, list):
+                    #             for item in each:
+                    #                 loss += item.sum()
+                    #         else:
+                    #             loss += each.sum()
                     loss.backward()
                     max_batch_size = batch_size  # Update the maximum batch size
                     batch_size *= 2  # Increase the batch size
 
                     if max_batch_size >= self.args.batch_size:
-                        print("Can support default batch size:",
-                              self.args.batch_size, max_batch_size)
-                        self.task_data_config_list[task_id][1]['max_batch'] = max_batch_size
-                        self.task_data_config_list[task_id][1]['checkpointing'] = False
+                        if self.logger:
+                            self.logger.info(f"can support default batchsize: {self.args.batch_size}, {max_batch_size}")
+                            self.task_data_config_list[task_id][1]['max_batch'] = max_batch_size
+                            self.task_data_config_list[task_id][1]['checkpointing'] = False
                         break
 
                 except Exception as e:
-                    task_name = self.task_data_config_list[task_id][1]['task_name']
-                    print(task_id,  "max batch size:", max_batch_size)
-                    # If any exception occurs, break the loop
+                    if self.logger:
+                        self.logger.info(f"An exception occurred: {e}")
+                        self.logger.info(
+                            f"task_id: {task_id}, dataset_name: {dataset_name}, max_batch_size: {max_batch_size}")
+                        self.logger.info(f"cannot support default batchsize: {self.args.batch_size}, {max_batch_size}")
+
                     self.task_data_config_list[task_id][1]['max_batch'] = max_batch_size
                     del model_tmp
-                    model_tmp = self._build_model(ddp=False)
-                    print(f"An exception occurred: {e}")
+                    torch.cuda.empty_cache()
                     break
-        print(self.task_data_config_list)
-        del model_tmp
         del extra_mem
+        try:
+            del model_tmp
+        except:
+            pass
         torch.cuda.empty_cache()
+        text = "Checking all task data config: \n"
+        text += json.dumps(self.task_data_config_list, indent=4)
+        if self.logger:
+            self.logger.info(text)
         return
