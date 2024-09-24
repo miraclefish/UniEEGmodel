@@ -7,25 +7,26 @@ d_model=512
 random_port=$((RANDOM % 9000 + 1000))
 
 export WANDB_API_KEY="ad9d2816977a1bcf87acf8a2763df7bc8fdc155a"
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export OMP_NUM_THREADS=1
 
 # Pretrain
-torchrun --nnodes 1 --nproc-per-node 4 --master_port $random_port run_pretrain.py \
+/home/ps/anaconda3/envs/time_series/bin/torchrun --nnodes 1 --nproc-per-node 8 --master_port $random_port run_pretrain.py \
   --ddp \
   --is_training 1 \
   --model $model_name \
   --prompt_num 8 \
   --patch_len 256 \
   --stride 256 \
-  --e_layers 4 \
+  --e_layers 8 \
   --d_model $d_model \
+  --clip_grad 5 \
   --des 'Exp' \
   --acc_it 1 \
-  --batch_size 256 \
-  --learning_rate 5e-5 \
+  --batch_size 1024 \
+  --learning_rate 5e-9 \
   --min_lr 1e-4 \
-  --weight_decay 5e-6 \
+  --weight_decay 5e-10 \
   --train_epochs 10 \
   --warmup_epochs 0 \
   --min_keep_ratio 0.5 \
@@ -33,7 +34,8 @@ torchrun --nnodes 1 --nproc-per-node 4 --master_port $random_port run_pretrain.p
   --min_mask_ratio 0.7 \
   --max_mask_ratio 0.8 \
   --debug $wandb_mode \
-  --task_data_config_path data_provider/multi_task_pretrain.yaml
+  --task_data_config_path data_provider/multi_task_pretrain.yaml \
+  --wandb > current.log 2>&1 &
 
 # Prompt tuning
 #torchrun --nnodes 1 --master_port $random_port run.py \
