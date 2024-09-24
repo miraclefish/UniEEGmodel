@@ -10,7 +10,7 @@ from timm.layers import Mlp, DropPath
 from timm.layers.helpers import to_2tuple
 from torch import fft
 from torch.quasirandom import SobolEngine
-
+from .mask_decoder import MaskDecoder, TwoWayTransformer
 
 def initialize_high_dimensional_space(batch_size, enc_in, num_class, dimension):
     # 创建一个 Sobol 生成器
@@ -545,6 +545,7 @@ class Model(nn.Module):
                 torch.nn.init.normal_(self.cls_tokens[task_data_name], std=.02)
 
         self.configs_list = configs_list
+        self.original_length = {config[0]: config[1]['window_size'] for config in self.configs_list}
         self.d_model = args.d_model
         self.amp_head = nn.Linear(2048, args.d_model)
         self.phase_head = nn.Linear(2048, args.d_model)
@@ -577,6 +578,23 @@ class Model(nn.Module):
         self.pretrain_predict = nn.Linear(args.d_model, args.patch_len)
         self.rul_token_head = nn.Linear(args.d_model * 3, args.d_model * 3)
         self.cls_token_head = nn.Linear(args.d_model * 3, args.d_model * 3)
+
+        # mask decoder
+        self.mask_decoder = MaskDecoder(
+            num_multimask_outputs=6,
+            num_channel_inputs=23,
+            num_channel_outputs=22,
+            transformer=TwoWayTransformer(
+                depth=2,
+                embedding_dim=args.d_model,
+                mlp_dim=2048,
+                num_heads=8,
+            ),
+            transformer_dim=args.d_model,
+            iou_head_depth=1,
+            iou_head_hidden_dim=256,
+        )
+
         self.debug = args.mode_debug
 
     def tokenize(self, x, mask=None):
@@ -602,7 +620,7 @@ class Model(nn.Module):
         x, n_vars = self.patch_embeddings(x)
         return x, means, stdev, n_vars, padding
 
-    def prepare_prompt(self, x, means, stdevs, n_vars, prefix_prompt, task_prompt, task_prompt_num, amp_token=None,
+    def prepare_prompt(self, x, means, stdevs, n_vars, prefix_prompt, task_prompt=None, task_prompt_num=0, amp_token=None,
                        phase_token=None, task_name=None, mask=None):
         x = torch.reshape(
             x, (-1, n_vars, x.shape[-2], x.shape[-1]))
@@ -611,7 +629,10 @@ class Model(nn.Module):
         # create stastical tokens
         mean_token = means.permute(0, 2, 1).unsqueeze(2).repeat(1, 1, 1, 512)
         stdev_token = stdevs.permute(0, 2, 1).unsqueeze(2).repeat(1, 1, 1, 512)
-        cls_tokens = torch.cat((amp_token, phase_token, task_prompt.repeat(x.shape[0], 1, 1, 1)), dim=2)  # [B,D,3,d]
+        if task_prompt:
+            cls_tokens = torch.cat((amp_token, phase_token, task_prompt.repeat(x.shape[0], 1, 1, 1)), dim=2)  # [B,D,3,d]
+        else:
+            cls_tokens = torch.cat((amp_token, phase_token), dim=2) # [B,D,2,d]
         x = x + self.position_embedding(x)
         x = torch.cat((mean_token, stdev_token, this_prompt, x, cls_tokens), dim=2)
 
@@ -662,6 +683,80 @@ class Model(nn.Module):
             distance = torch.einsum('nvkc,nvmc->nvm', cls_token, category_token)
             distance = distance.mean(dim=1).softmax(dim=-1)
             return distance
+
+    def segmentation(self, x, task_id):
+        dataset_name = self.configs_list[task_id][1]['dataset']
+        task_data_name = self.configs_list[task_id][0]
+        prefix_prompt = self.prompt_tokens[dataset_name]
+        # task_prompt = self.cls_tokens[task_data_name]
+        # task_prompt_num = 1
+        # category_token = self.category_tokens[task_data_name]
+        amp_token, phase_token = self.get_freq_tokens(x)  # [B,D,d]
+        amp_token, phase_token = amp_token.unsqueeze(2), phase_token.unsqueeze(2)  # [B,D,1,d]
+        x, means, stdev, n_vars, _ = self.tokenize(x)
+
+        seq_len = x.shape[-2]
+
+        x = self.prepare_prompt(
+            x, means, stdev, n_vars, prefix_prompt,
+            amp_token=amp_token, phase_token=phase_token, task_name='segmentation')
+
+        x = self.backbone(x, prefix_prompt.shape[2], seq_len)
+        B, V, L, C = x.shape
+
+        x_embedding = x[:, :, 10:-2]
+        x_pe = self.position_embedding(x_embedding).expand_as(x_embedding)
+        low_res_masks = self.mask_decoder(x_embedding, x_pe, None, None, False)
+
+        masks = self.postprocess_masks(low_res_masks, dataset_name)
+        masks = F.sigmoid(masks)
+
+        return masks
+
+    # 这个 postprocess_masks 方法实现了掩码的后处理, 包含去除填充和将掩码放大到原始图像大小两步。
+    # 1. 输入参数:
+    #     - masks: 从 mask_decoder 输出的批量掩码,形状为 BxCxHxW。
+    #     - input_size: 输入图像大小,形状为 (H, W)。用于去除填充。
+    #     - original_size: 调整大小前的原始图像大小,形状为 (H, W)。
+    # 2. 使用 F.interpolate 将 masks 放大到 image_encoder.img_size x image_encoder.img_size。
+    # 3. 使用 masks[..., : input_size[0], : input_size[1]] 去除 masks 中的填充。
+    # 4. 使用 F.interpolate 再将 masks 放大到 original_size 大小。
+    # 5. 返回放大后的 masks。
+    # 所以, 这个 postprocess_masks 方法实现了掩码的后处理,包含去除填充和恢复原始大小两步。
+    # 它使模型最终输出与原始输入图像大小相匹配的掩码, 为掩码的实际应用提供方便。
+    def postprocess_masks(
+        self,
+        masks: torch.Tensor,
+        dataset_name: str
+    ) -> torch.Tensor:
+        """
+        Remove padding and upscale masks to the original image size.
+
+        Arguments:
+          masks (torch.Tensor): Batched masks from the mask_decoder,
+            in BxCxHxW format.
+          input_size (tuple(int, int)): The size of the image input to the
+            model, in (H, W) format. Used to remove padding.
+          original_size (tuple(int, int)): The original size of the image
+            before resizing for input to the model, in (H, W) format.
+
+        Returns:
+          (torch.Tensor): Batched masks in BxCxHxW format, where (H, W)
+            is given by original_size.
+        """
+        b, c, h, w = masks.shape
+        masks = masks.view(b * c, h, w)
+
+        masks = F.interpolate(
+            masks,
+            self.original_length[dataset_name],
+            mode="linear",
+            align_corners=False,
+        )
+        masks = masks.view(b, c, *masks.shape[1:])
+        masks = masks.permute(0, 3, 2, 1)
+
+        return masks
 
     def random_masking(self, x, min_mask_ratio, max_mask_ratio):
         """
@@ -868,6 +963,9 @@ class Model(nn.Module):
             else:
                 dec_out = self.classification(x_enc, x_mark_enc, task_id)
                 return dec_out  # [B, N]
+        if 'segmentation' in task_name:
+            output = self.segmentation(x_enc, task_id)
+            return output
         if 'pretrain' in task_name:
             dec_out = self.pretraining(x_enc, x_mark_enc, task_id,
                                        enable_mask=enable_mask)
